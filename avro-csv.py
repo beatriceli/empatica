@@ -2,20 +2,23 @@
 avro-csv.py
 -----------
 Read Empatica EMBRACE+ Avro files, unpack each signal into a time-series
-and write one CSV per signal inside a folder named after the participant.
+and write one CSV per signal inside a session folder named after the participant.
 
 Output layout:
   OUTPUT_DIR/
     <participant_id>/
-      accelerometer.csv   (columns: timestamp_utc, timestamp_local, x, y, z)
-      eda.csv             (columns: timestamp_utc, timestamp_local, value)
-      temperature.csv
-      bvp.csv
-      steps.csv
-      systolic_peaks.csv
-      tags.csv
-      hr.csv      (columns: timestamp_utc, timestamp_local, ibi_s, bpm)
-      hrv.csv             (columns: timestamp_utc, timestamp_local, rmssd_ms, sdnn_ms, pnn50)
+      <YYYY-MM-DD_HHMM>/            ← session folder (local time of first file)
+        accelerometer.csv   (columns: timestamp_utc, timestamp_local, x, y, z)
+        eda.csv             (columns: timestamp_utc, timestamp_local, value)
+        temperature.csv
+        bvp.csv
+        steps.csv
+        systolic_peaks.csv
+        tags.csv
+
+Sessions are detected by gaps in the actual signal data between consecutive Avro
+files. A gap > SESSION_GAP_SECONDS between the last sample of one file and the
+first sample of the next is treated as a session boundary.
 
 Expected directory layout:
   DATA_ROOT/
@@ -31,6 +34,7 @@ Usage:
 """
 
 import argparse
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import fastavro
@@ -41,9 +45,10 @@ import pandas as pd
 # Configuration
 # --------------------------------------------------------------------------- #
 DATA_ROOT = Path.home() / "Downloads" / "empatica_raw"
+SESSION_GAP_SECONDS = 30 * 60   # 30-minute data gap → new session
 
 # --------------------------------------------------------------------------- #
-# Helpers
+# Signal helpers
 # --------------------------------------------------------------------------- #
 
 def _us_to_timestamps(start_us: int, fs: float, n: int, tz_offset_s: int):
@@ -167,72 +172,82 @@ def unpack_record(record: dict) -> dict[str, list[dict]]:
 
 
 # --------------------------------------------------------------------------- #
-# Heart rate & HRV
+# Session detection
 # --------------------------------------------------------------------------- #
 
-# Rolling window size (number of beats) for HRV metrics.
-HRV_WINDOW_BEATS = 30
+@dataclass
+class FileInfo:
+    path: Path
+    t_start: pd.Timestamp          # earliest data timestamp in this file
+    t_end: pd.Timestamp            # latest data timestamp in this file
+    tz_offset: int                 # seconds (e.g. -14400 for UTC-4)
+    data: dict = field(default_factory=dict)   # (pid, signal) -> list[dict]
 
-# Physiologically valid IBI range (ms). Beats outside this are treated as
-# artefacts and excluded before computing HRV.
-IBI_MIN_MS = 300   # 200 BPM max
-IBI_MAX_MS = 2000  # 30 BPM min
+
+def read_avro_file(avro_path: Path, participant_folder: str) -> FileInfo | None:
+    """Read one Avro file, returning its data and actual data time range."""
+    data: dict[tuple[str, str], list[dict]] = {}
+    tz_offset = 0
+
+    with open(avro_path, "rb") as f:
+        for record in fastavro.reader(f):
+            tz_offset = record.get("timezone", 0)
+            pid = (record.get("enrollment", {}) or {}).get("participantID")
+            if not pid and pid != 0:
+                pid = participant_folder
+            pid = str(pid)
+
+            for signal, rows in unpack_record(record).items():
+                data.setdefault((pid, signal), []).extend(rows)
+
+    if not data:
+        return None
+
+    # Derive time range from actual data (first/last of each signal)
+    all_ts = []
+    for rows in data.values():
+        if rows:
+            all_ts.append(rows[0]["timestamp_utc"])
+            all_ts.append(rows[-1]["timestamp_utc"])
+
+    if not all_ts:
+        return None
+
+    return FileInfo(
+        path=avro_path,
+        t_start=min(all_ts),
+        t_end=max(all_ts),
+        tz_offset=tz_offset,
+        data=data,
+    )
 
 
-def compute_hr_hrv(peaks_rows: list[dict]) -> tuple[pd.DataFrame, pd.DataFrame]:
+def group_into_sessions(file_infos: list[FileInfo]) -> list[list[FileInfo]]:
     """
-    Given a list of systolic-peak row dicts (keys: timestamp_utc, timestamp_local),
-    return (heart_rate_df, hrv_df).
-
-    heart_rate_df columns: timestamp_utc, timestamp_local, ibi_s, bpm
-      – one row per beat (starting from the 2nd peak)
-
-    hrv_df columns: timestamp_utc, timestamp_local, rmssd_ms, sdnn_ms, pnn50
-      – one row per beat computed over a rolling window of HRV_WINDOW_BEATS
+    Group FileInfos (sorted by t_start) into sessions.
+    A new session starts when the gap between the end of the previous file
+    and the start of the next exceeds SESSION_GAP_SECONDS.
     """
-    if len(peaks_rows) < 2:
-        return pd.DataFrame(), pd.DataFrame()
+    gap = pd.Timedelta(seconds=SESSION_GAP_SECONDS)
+    sessions: list[list[FileInfo]] = []
+    current: list[FileInfo] = []
 
-    df = pd.DataFrame(peaks_rows).sort_values("timestamp_utc").reset_index(drop=True)
+    for fi in sorted(file_infos, key=lambda x: x.t_start):
+        if current and (fi.t_start - current[-1].t_end) > gap:
+            sessions.append(current)
+            current = []
+        current.append(fi)
 
-    # IBI in seconds and milliseconds
-    df["ibi_s"]  = df["timestamp_utc"].diff().dt.total_seconds()
-    df["ibi_ms"] = df["ibi_s"] * 1000.0
+    if current:
+        sessions.append(current)
 
-    # Drop the first row (no preceding peak) and artefacts
-    df = df.dropna(subset=["ibi_ms"])
-    df = df[(df["ibi_ms"] >= IBI_MIN_MS) & (df["ibi_ms"] <= IBI_MAX_MS)].copy()
-    df.reset_index(drop=True, inplace=True)
+    return sessions
 
-    if df.empty:
-        return pd.DataFrame(), pd.DataFrame()
 
-    # ---- Heart rate --------------------------------------------------------
-    df["bpm"] = 60.0 / df["ibi_s"]
-    hr_df = df[["timestamp_utc", "timestamp_local", "ibi_s", "bpm"]].copy()
-
-    # ---- HRV (rolling window) ----------------------------------------------
-    ibi = df["ibi_ms"].to_numpy()
-
-    rmssd_vals = np.full(len(ibi), np.nan)
-    sdnn_vals  = np.full(len(ibi), np.nan)
-    pnn50_vals = np.full(len(ibi), np.nan)
-
-    for i in range(HRV_WINDOW_BEATS - 1, len(ibi)):
-        window = ibi[i - HRV_WINDOW_BEATS + 1 : i + 1]
-        successive_diffs = np.diff(window)
-
-        rmssd_vals[i] = np.sqrt(np.mean(successive_diffs ** 2))
-        sdnn_vals[i]  = np.std(window, ddof=1)
-        pnn50_vals[i] = np.mean(np.abs(successive_diffs) > 50.0) * 100.0
-
-    hrv_df = df[["timestamp_utc", "timestamp_local"]].copy()
-    hrv_df["rmssd_ms"] = rmssd_vals
-    hrv_df["sdnn_ms"]  = sdnn_vals
-    hrv_df["pnn50"]    = pnn50_vals
-    hrv_df = hrv_df.dropna(subset=["rmssd_ms"]).reset_index(drop=True)
-
-    return hr_df, hrv_df
+def format_session_name(t_start: pd.Timestamp, tz_offset_s: int) -> str:
+    """Return a folder name like '2026-03-11_2018' from a UTC timestamp and tz offset."""
+    local = t_start + pd.Timedelta(seconds=tz_offset_s)
+    return local.strftime("%Y-%m-%d_%H%M")
 
 
 # --------------------------------------------------------------------------- #
@@ -240,9 +255,6 @@ def compute_hr_hrv(peaks_rows: list[dict]) -> tuple[pd.DataFrame, pd.DataFrame]:
 # --------------------------------------------------------------------------- #
 
 def main(data_root: Path, output_dir: Path | None) -> None:
-    # Accumulate rows keyed by (participant_id, signal_name)
-    data: dict[tuple[str, str], list[dict]] = {}
-
     avro_files = sorted(data_root.glob("**/participant_data/*/*/raw_data/*/*.avro"))
     if not avro_files:
         print(f"No .avro files found under {data_root}")
@@ -252,56 +264,54 @@ def main(data_root: Path, output_dir: Path | None) -> None:
         participant_data_dir = next(p for p in avro_files[0].parents if p.name == "participant_data")
         output_dir = participant_data_dir.parent / "participant_csv"
 
-    print(f"Found {len(avro_files)} .avro file(s).")
+    # Group avro files by participant folder
+    by_participant: dict[str, list[Path]] = {}
+    for f in avro_files:
+        participant_folder = f.parts[-4]   # e.g. 0-3YK3K1526F
+        by_participant.setdefault(participant_folder, []).append(f)
 
-    for avro_path in avro_files:
-        participant_folder = avro_path.parts[-4]   # e.g. 0-3YK3K1526F
+    print(f"Found {len(avro_files)} .avro file(s) across {len(by_participant)} participant(s).\n")
 
-        with open(avro_path, "rb") as f:
-            for record in fastavro.reader(f):
-                pid = (record.get("enrollment", {}) or {}).get("participantID")
-                if not pid and pid != 0:
-                    pid = participant_folder
-                pid = str(pid)
-
-                for signal, rows in unpack_record(record).items():
-                    data.setdefault((pid, signal), []).extend(rows)
-
-    # Write output: output_dir/<participant_id>/<signal>.csv
     participants_written = set()
-    for (pid, signal) in sorted(data.keys()):
-        rows = data[(pid, signal)]
-        participant_dir = output_dir / pid
-        participant_dir.mkdir(parents=True, exist_ok=True)
+    for participant_folder, files in sorted(by_participant.items()):
+        # Read all files for this participant (single pass)
+        file_infos = []
+        for avro_path in files:
+            fi = read_avro_file(avro_path, participant_folder)
+            if fi is not None:
+                file_infos.append(fi)
 
-        df = pd.DataFrame(rows)
-        df.sort_values("timestamp_utc", inplace=True)
-        df.reset_index(drop=True, inplace=True)
-
-        out_path = participant_dir / f"{signal}.csv"
-        df.to_csv(out_path, index=False)
-        print(f"  → {out_path}  ({len(df):,} rows)")
-        participants_written.add(pid)
-
-    # Compute heart rate and HRV from systolic peaks
-    all_pids = {pid for (pid, _) in data.keys()}
-    for pid in sorted(all_pids):
-        peaks_rows = data.get((pid, "systolic_peaks"), [])
-        if not peaks_rows:
+        if not file_infos:
+            print(f"{participant_folder}: no data found, skipping")
             continue
 
-        hr_df, hrv_df = compute_hr_hrv(peaks_rows)
-        participant_dir = output_dir / pid
+        sessions = group_into_sessions(file_infos)
+        print(f"{participant_folder}: {len(sessions)} session(s)")
 
-        if not hr_df.empty:
-            out_path = participant_dir / "hr.csv"
-            hr_df.to_csv(out_path, index=False)
-            print(f"  → {out_path}  ({len(hr_df):,} rows)")
+        for session_file_infos in sessions:
+            first = session_file_infos[0]
+            session_name = format_session_name(first.t_start, first.tz_offset)
 
-        if not hrv_df.empty:
-            out_path = participant_dir / "hrv.csv"
-            hrv_df.to_csv(out_path, index=False)
-            print(f"  → {out_path}  ({len(hrv_df):,} rows)")
+            # Merge data across all files in this session
+            data: dict[tuple[str, str], list[dict]] = {}
+            for fi in session_file_infos:
+                for key, rows in fi.data.items():
+                    data.setdefault(key, []).extend(rows)
+
+            # Write output: output_dir/<pid>/<session_name>/<signal>.csv
+            for (pid, signal) in sorted(data.keys()):
+                rows = data[(pid, signal)]
+                session_dir = output_dir / pid / session_name
+                session_dir.mkdir(parents=True, exist_ok=True)
+
+                df = pd.DataFrame(rows)
+                df.sort_values("timestamp_utc", inplace=True)
+                df.reset_index(drop=True, inplace=True)
+
+                out_path = session_dir / f"{signal}.csv"
+                df.to_csv(out_path, index=False)
+                print(f"  → {out_path}  ({len(df):,} rows)")
+                participants_written.add(pid)
 
     print(f"\nDone. {len(participants_written)} participant folder(s) written to {output_dir}")
 

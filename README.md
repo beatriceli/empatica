@@ -125,6 +125,34 @@ python avro-csv.py --data path/to/avro/root --out path/to/csv/output
 
 ---
 
+## Heart rate & HRV processing
+
+Heart rate and HRV are derived from the systolic peak timestamps detected by the EMBRACE+ PPG sensor. Each inter-beat interval (IBI) is the elapsed time between two consecutive peaks.
+
+### IBI artefact correction
+
+Raw PPG IBIs contain artefacts from motion, poor skin contact, and missed or false peaks. Two correction stages are applied before any HR or HRV metric is computed:
+
+**Stage 1 — Hard physiological bounds**
+IBIs outside [300 ms, 2000 ms] (30–200 BPM) are physiologically impossible and are replaced with NaN.
+
+**Stage 2 — Local median threshold**
+Each IBI is compared to the median of the 11 surrounding beats (centred window, ±5 beats). If it deviates by more than 20% from that local median it is flagged as an artefact and replaced with NaN. This catches ectopic beats, missed detections, and motion spikes that fall within the hard bounds but are inconsistent with the local rhythm.
+
+Both stages are repaired by linear interpolation to preserve the beat timeline.
+
+### HRV metrics
+
+All metrics are computed over a rolling 30-beat window (~30 s at resting HR).
+
+| Metric | Description |
+|--------|-------------|
+| `rmssd_ms` | Root mean square of successive IBI differences. Reflects short-term parasympathetic (vagal) activity. Most robust metric for short recordings and wearable data. |
+| `sdnn_ms` | Standard deviation of IBIs over the window. Reflects overall HRV from both sympathetic and parasympathetic activity. |
+| `pnn50` | Percentage of successive IBI pairs differing by > 50 ms. Parasympathetic index correlated with RMSSD. |
+
+---
+
 ## Full pipeline
 
 ```bash
