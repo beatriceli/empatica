@@ -31,6 +31,7 @@ Usage:
   python avro-csv.py                          # uses DATA_ROOT below
   python avro-csv.py --data path/to/data      # override data root
   python avro-csv.py --out  path/to/output    # override output dir
+  python avro-csv.py --since 2026-03-20       # only process date folders >= this date
 """
 
 import argparse
@@ -254,10 +255,12 @@ def format_session_name(t_start: pd.Timestamp, tz_offset_s: int) -> str:
 # Main
 # --------------------------------------------------------------------------- #
 
-def main(data_root: Path, output_dir: Path | None) -> None:
+def main(data_root: Path, output_dir: Path | None, since: str | None = None) -> None:
     avro_files = sorted(data_root.glob("**/participant_data/*/*/raw_data/*/*.avro"))
+    if since:
+        avro_files = [f for f in avro_files if f.parts[-5] >= since]
     if not avro_files:
-        print(f"No .avro files found under {data_root}")
+        print(f"No .avro files found under {data_root}" + (f" since {since}" if since else ""))
         return
 
     if output_dir is None:
@@ -318,7 +321,8 @@ def main(data_root: Path, output_dir: Path | None) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert Empatica Avro files to per-participant CSVs.")
-    parser.add_argument("--data", type=Path, default=DATA_ROOT,  help="Root directory of Avro files")
-    parser.add_argument("--out",  type=Path, default=None, help="Output directory for CSVs (default: participant_csv/ alongside participant_data/)")
+    parser.add_argument("--data",  type=Path, default=DATA_ROOT, help="Root directory of Avro files")
+    parser.add_argument("--out",   type=Path, default=None, help="Output directory for CSVs (default: participant_csv/ alongside participant_data/)")
+    parser.add_argument("--since", type=str,  default=None, metavar="YYYY-MM-DD", help="Only process date folders on or after this date")
     args = parser.parse_args()
-    main(args.data, args.out)
+    main(args.data, args.out, args.since)
