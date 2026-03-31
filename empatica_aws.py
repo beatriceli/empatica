@@ -48,9 +48,11 @@ def list_keys(bucket, prefix, since: date | None = None):
 
 
 def download_file(bucket, key, local_root):
-    """Download a single S3 object, stripping the S3 prefix from the local path."""
-    relative_key = key[len(PREFIX):]
-    local_path = local_root / relative_key
+    """Download a single S3 object, stripping the S3 prefix and leading numeric path segments."""
+    parts = key[len(PREFIX):].lstrip("/").split("/")
+    while parts and parts[0].isdigit():
+        parts.pop(0)
+    local_path = local_root / Path(*parts)
     if local_path.exists():
         return
     local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -75,7 +77,7 @@ def main():
     )
     args = parser.parse_args()
 
-    local_root = args.output_dir / "empatica_raw"
+    local_root = args.output_dir.expanduser() / "empatica_raw"
 
     since_label = f" (since {args.since})" if args.since else ""
     print(f"Listing s3://{BUCKET}/{PREFIX}{since_label} ...")
