@@ -302,6 +302,7 @@ def main(data_root: Path, output_dir: Path | None, since: str | None = None) -> 
                     data.setdefault(key, []).extend(rows)
 
             # Write output: output_dir/<pid>/<session_name>/<signal>.csv
+            written_sessions = set()
             for (pid, signal) in sorted(data.keys()):
                 rows = data[(pid, signal)]
                 session_dir = output_dir / pid / session_name
@@ -313,8 +314,10 @@ def main(data_root: Path, output_dir: Path | None, since: str | None = None) -> 
 
                 out_path = session_dir / f"{signal}.csv"
                 df.to_csv(out_path, index=False)
-                print(f"  → {out_path}  ({len(df):,} rows)")
                 participants_written.add(pid)
+                if (pid, session_name) not in written_sessions:
+                    print(f"  → {pid}/{session_name}")
+                    written_sessions.add((pid, session_name))
 
     print(f"\nDone. {len(participants_written)} participant folder(s) written to {output_dir}")
 

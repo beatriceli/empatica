@@ -9,7 +9,7 @@ load_dotenv()
 
 _s3_url = os.getenv("S3_URL", "").lstrip("s3://")
 BUCKET, _, PREFIX = _s3_url.partition("/")
-LOCAL_ROOT = Path.home() / "Downloads" / "empatica_raw"
+_SCRIPT_DIR = Path(__file__).parent
 
 s3 = boto3.client(
     "s3",
@@ -60,6 +60,13 @@ def download_file(bucket, key, local_root):
 def main():
     parser = argparse.ArgumentParser(description="Download Empatica data files from S3.")
     parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=_SCRIPT_DIR,
+        metavar="DIR",
+        help="Directory to save downloaded files (default: script directory).",
+    )
+    parser.add_argument(
         "--since",
         type=date.fromisoformat,
         default=None,
@@ -68,15 +75,17 @@ def main():
     )
     args = parser.parse_args()
 
+    local_root = args.output_dir / "empatica_raw"
+
     since_label = f" (since {args.since})" if args.since else ""
     print(f"Listing s3://{BUCKET}/{PREFIX}{since_label} ...")
     keys = list(list_keys(BUCKET, PREFIX, since=args.since))
     print(f"Found {len(keys)} files\n")
 
     for key in keys:
-        download_file(BUCKET, key, LOCAL_ROOT)
+        download_file(BUCKET, key, local_root)
 
-    print(f"\nDone. Files saved under: {LOCAL_ROOT.resolve()}")
+    print(f"\nDone. Files saved under: {local_root.resolve()}")
 
 
 if __name__ == "__main__":
