@@ -19,12 +19,12 @@ s3 = boto3.client(
 )
 
 
-def list_keys(bucket, prefix, since: date | None = None):
+def list_keys(bucket, prefix, since: date | None = None, skip_metadata: bool = False):
     """Yield all .avro and .csv object keys under prefix, handling pagination.
 
     If since is provided, keys that contain a YYYY-MM-DD path segment are only
     yielded when that date >= since. Keys without a date segment (e.g. metadata)
-    are always yielded.
+    are always yielded unless skip_metadata is True.
     """
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
@@ -32,17 +32,21 @@ def list_keys(bucket, prefix, since: date | None = None):
             key = obj["Key"]
             if not (key.endswith(".avro") or key.endswith(".csv")):
                 continue
-            if since is not None:
+            has_date = False
+            if since is not None or skip_metadata:
                 for part in key.split("/"):
                     try:
                         key_date = date.fromisoformat(part)
                     except ValueError:
                         continue
-                    # Found a date segment — apply the filter
-                    if key_date < since:
+                    has_date = True
+                    # Found a date segment — apply the since filter
+                    if since is not None and key_date < since:
                         key = None
                     break
                 if key is None:
+                    continue
+                if skip_metadata and not has_date:
                     continue
             yield key
 
@@ -73,7 +77,12 @@ def main():
         type=date.fromisoformat,
         default=None,
         metavar="YYYY-MM-DD",
-        help="Only download participant files on or after this date (e.g. 2026-03-01). Metadata is always downloaded.",
+        help="Only download participant files on or after this date (e.g. 2026-03-01). Metadata is always downloaded unless --skip-metadata is set.",
+    )
+    parser.add_argument(
+        "--skip-metadata",
+        action="store_true",
+        help="Skip files without a date path segment (e.g. metadata folders).",
     )
     args = parser.parse_args()
 
@@ -81,7 +90,7 @@ def main():
 
     since_label = f" (since {args.since})" if args.since else ""
     print(f"Listing s3://{BUCKET}/{PREFIX}{since_label} ...")
-    keys = list(list_keys(BUCKET, PREFIX, since=args.since))
+    keys = list(list_keys(BUCKET, PREFIX, since=args.since, skip_metadata=args.skip_metadata))
     print(f"Found {len(keys)} files\n")
 
     for key in keys:
